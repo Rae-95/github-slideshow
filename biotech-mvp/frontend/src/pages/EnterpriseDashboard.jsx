@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Routes, Route, Link, useNavigate } from 'react-router-dom';
 import { projectsApi, bdApi } from '../services/api';
 import ProjectCard from '../components/ProjectCard';
-import CreditScoreBadge from '../components/CreditScoreBadge';
+import AnonymousBDCard from '../components/AnonymousBDCard';
 
 // ── 项目列表 ──────────────────────────────────────────────
 function ProjectList() {
@@ -162,113 +162,120 @@ function CreateProject() {
   );
 }
 
-// ── BD列表（企业视角）─────────────────────────────────────
+// ── BD列表（企业视角，全匿名展示）───────────────────────
 function BDList() {
   const [bds, setBDs] = useState([]);
   const [filters, setFilters] = useState({ expertise: '', minScore: 0, keyword: '' });
   const [loading, setLoading] = useState(true);
+  const [selectedProject, setSelectedProject] = useState('');
+  const [projects, setProjects] = useState([]);
 
   useEffect(() => {
-    bdApi.list(filters).then(r => setBDs(r.data.bds)).finally(() => setLoading(false));
+    Promise.all([
+      bdApi.list().then(r => setBDs(r.data.bds)),
+      projectsApi.list().then(r => setProjects(r.data.projects.filter(p => p.status === 'open'))),
+    ]).finally(() => setLoading(false));
   }, []);
 
-  const search = () => {
+  const handleSearch = () => {
     setLoading(true);
     bdApi.list(filters).then(r => setBDs(r.data.bds)).finally(() => setLoading(false));
   };
 
+  const handleInvite = async (projectId, bdId) => {
+    await projectsApi.inviteBD(projectId, bdId);
+  };
+
   return (
     <div className="max-w-6xl mx-auto px-4 py-8">
-      <h1 className="text-2xl font-bold text-gray-900 mb-6">BD资源库</h1>
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">BD资源库</h1>
+          <p className="text-sm text-gray-400 mt-1">所有BD以虚拟身份展示，真实信息撮合成功后解锁</p>
+        </div>
+        <div className="flex items-center gap-2 bg-yellow-50 border border-yellow-200 rounded-lg px-3 py-2">
+          <span className="text-sm">🔒</span>
+          <span className="text-xs text-yellow-700">匿名保护模式</span>
+        </div>
+      </div>
 
       {/* 筛选器 */}
-      <div className="bg-white rounded-xl border border-gray-200 p-4 mb-6 flex flex-wrap gap-3">
-        <input
-          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm flex-1 min-w-40"
-          placeholder="搜索关键词..."
-          value={filters.keyword} onChange={e => setFilters({ ...filters, keyword: e.target.value })}
-        />
-        <select
-          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
-          value={filters.expertise} onChange={e => setFilters({ ...filters, expertise: e.target.value })}
-        >
-          <option value="">全部领域</option>
-          <option value="oncology">肿瘤学</option>
-          <option value="immunology">免疫学</option>
-          <option value="cdmo">CDMO</option>
-          <option value="clinical">临床研究</option>
-          <option value="regulatory">注册法规</option>
-        </select>
-        <select
-          className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
-          value={filters.minScore} onChange={e => setFilters({ ...filters, minScore: Number(e.target.value) })}
-        >
-          <option value={0}>信用分不限</option>
-          <option value={60}>60分以上</option>
-          <option value={70}>70分以上</option>
-          <option value={80}>80分以上</option>
-          <option value={90}>90分以上</option>
-        </select>
-        <button onClick={search} className="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm">搜索</button>
+      <div className="bg-white rounded-xl border border-gray-200 p-4 mb-6">
+        <div className="flex flex-wrap gap-3 mb-3">
+          <input
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm flex-1 min-w-40"
+            placeholder="搜索能力标签、关键词..."
+            value={filters.keyword}
+            onChange={e => setFilters({ ...filters, keyword: e.target.value })}
+            onKeyDown={e => e.key === 'Enter' && handleSearch()}
+          />
+          <select
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
+            value={filters.expertise}
+            onChange={e => setFilters({ ...filters, expertise: e.target.value })}
+          >
+            <option value="">全部领域</option>
+            <option value="肿瘤">肿瘤学</option>
+            <option value="免疫">免疫学</option>
+            <option value="CDMO">CDMO</option>
+            <option value="临床">临床研究</option>
+            <option value="注册">注册法规</option>
+            <option value="细胞治疗">细胞治疗</option>
+          </select>
+          <select
+            className="border border-gray-300 rounded-lg px-3 py-1.5 text-sm"
+            value={filters.minScore}
+            onChange={e => setFilters({ ...filters, minScore: Number(e.target.value) })}
+          >
+            <option value={0}>信用分不限</option>
+            <option value={70}>A级以上（70+）</option>
+            <option value={80}>AA级以上（80+）</option>
+            <option value={90}>AAA级（90+）</option>
+          </select>
+          <button
+            onClick={handleSearch}
+            className="bg-blue-600 text-white px-5 py-1.5 rounded-lg text-sm font-medium hover:bg-blue-700"
+          >
+            搜索
+          </button>
+        </div>
+
+        {/* 邀请时关联项目选择 */}
+        {projects.length > 0 && (
+          <div className="flex items-center gap-2 pt-3 border-t border-gray-100">
+            <span className="text-xs text-gray-500">邀请时关联项目：</span>
+            <select
+              className="border border-gray-300 rounded-lg px-3 py-1 text-sm flex-1 max-w-xs"
+              value={selectedProject}
+              onChange={e => setSelectedProject(e.target.value)}
+            >
+              <option value="">选择项目（可选）</option>
+              {projects.map(p => (
+                <option key={p.id} value={p.id}>{p.title}</option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {loading ? (
         <div className="text-center py-20 text-gray-400">加载中...</div>
+      ) : bds.length === 0 ? (
+        <div className="text-center py-16 bg-white rounded-xl border border-dashed border-gray-300">
+          <p className="text-gray-400">暂未找到符合条件的BD</p>
+        </div>
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {bds.map(bd => <BDCard key={bd.id} bd={bd} />)}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+          {bds.map(bd => (
+            <AnonymousBDCard
+              key={bd.id}
+              bd={bd}
+              projectId={selectedProject || undefined}
+              onInvite={selectedProject ? handleInvite : undefined}
+            />
+          ))}
         </div>
       )}
-    </div>
-  );
-}
-
-function BDCard({ bd }) {
-  return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5 hover:shadow-md transition-shadow">
-      <div className="flex items-start justify-between mb-3">
-        <div className="flex items-center gap-3">
-          <div className="w-12 h-12 bg-gradient-to-br from-green-400 to-blue-500 rounded-full flex items-center justify-center text-white font-bold text-lg">
-            {bd.codeName?.[0] || 'B'}
-          </div>
-          <div>
-            <p className="font-semibold text-gray-900">{bd.codeName}</p>
-            <p className="text-xs text-gray-400">虚拟身份 · {bd.yearsExperience}年经验</p>
-          </div>
-        </div>
-        <CreditScoreBadge score={bd.creditScore} />
-      </div>
-
-      <div className="flex flex-wrap gap-1 mb-3">
-        {(bd.expertiseTags || []).slice(0, 4).map(tag => (
-          <span key={tag} className="text-xs bg-green-50 text-green-700 border border-green-200 px-2 py-0.5 rounded">
-            {tag}
-          </span>
-        ))}
-      </div>
-
-      <p className="text-sm text-gray-500 line-clamp-2 mb-3">{bd.summary}</p>
-
-      <div className="grid grid-cols-3 gap-2 text-center text-xs text-gray-500 border-t pt-3 mb-3">
-        <div><p className="font-semibold text-gray-800">{bd.patentCount || 0}</p><p>专利数</p></div>
-        <div><p className="font-semibold text-gray-800">{bd.paperCount || 0}</p><p>论文数</p></div>
-        <div><p className="font-semibold text-gray-800">{bd.successCases || 0}</p><p>成功案例</p></div>
-      </div>
-
-      <div className="flex gap-2">
-        <Link
-          to={`/bd-profile/${bd.id}`}
-          className="flex-1 text-center text-sm bg-gray-50 text-gray-600 py-1.5 rounded-lg hover:bg-gray-100"
-        >
-          查看资料
-        </Link>
-        <Link
-          to={`/ai-report/${bd.id}`}
-          className="flex-1 text-center text-sm bg-blue-50 text-blue-600 py-1.5 rounded-lg hover:bg-blue-100"
-        >
-          AI背调报告
-        </Link>
-      </div>
     </div>
   );
 }

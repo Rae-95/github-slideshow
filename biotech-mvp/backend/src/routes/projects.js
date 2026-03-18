@@ -1,6 +1,7 @@
 const express = require('express');
 const { db } = require('../services/db');
 const { requireRole } = require('../middleware/auth');
+const { maskProject } = require('../middleware/privacy');
 
 const router = express.Router();
 
@@ -42,7 +43,13 @@ router.get('/', async (req, res, next) => {
     query += ` LIMIT $${params.length - 1} OFFSET $${params.length}`;
 
     const result = await db.query(query, params);
-    res.json({ projects: result.rows.map(formatProject) });
+    const isOwner = (p) => req.user.role === 'enterprise' && p.enterprise_id === req.user.id;
+    res.json({
+      projects: result.rows.map(row => {
+        const p = formatProject(row);
+        return maskProject(p, req.user.role, isOwner(row));
+      })
+    });
   } catch (err) {
     next(err);
   }
@@ -58,7 +65,8 @@ router.get('/:id', async (req, res, next) => {
       [req.params.id]
     );
     if (!result.rows[0]) return res.status(404).json({ message: '项目不存在' });
-    res.json({ project: formatProject(result.rows[0]) });
+    const isOwner = req.user.role === 'enterprise' && result.rows[0].enterprise_id === req.user.id;
+    res.json({ project: maskProject(formatProject(result.rows[0]), req.user.role, isOwner) });
   } catch (err) {
     next(err);
   }
@@ -158,6 +166,7 @@ router.get('/:id/matches', requireRole('enterprise', 'admin'), async (req, res, 
 function formatProject(row) {
   return {
     id: row.id,
+    enterpriseId: row.enterprise_id,   // 内部用于所有权判断，不对外输出
     title: row.title,
     type: row.type,
     description: row.description,
