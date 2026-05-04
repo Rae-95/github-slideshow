@@ -1,0 +1,769 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DrugScan Pro — 超微量高通量药物筛选平台</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { margin: 0; font-family: -apple-system, 'PingFang SC', 'Noto Sans SC', sans-serif; }
+    .gradient-hero { background: linear-gradient(145deg, #0c1829 0%, #0d2b4b 45%, #0a1e38 100%); }
+    .well { width: 13px; height: 13px; border-radius: 50%; cursor: pointer;
+            transition: transform .12s, box-shadow .12s; flex-shrink: 0; }
+    .well:hover { transform: scale(1.6); position: relative; z-index: 20; }
+    .card-lift { transition: box-shadow .2s, transform .2s; }
+    .card-lift:hover { box-shadow: 0 12px 36px rgba(0,0,0,.1); transform: translateY(-2px); }
+    .fade-in { animation: fadeIn .4s ease-in; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    .pill { display: inline-flex; align-items: center; border-radius: 9999px; padding: 2px 10px; font-size: 11px; font-weight: 600; }
+    /* Scrollbar */
+    .thin-scroll::-webkit-scrollbar { width: 4px; }
+    .thin-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-gray-50 text-gray-900">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+/* ─────────────────────────────────────────────────────────
+   Mock data: 384-well kinase-inhibitor screen
+   Column 1 = positive control (ref inhibitor, ~95% inh)
+   Column 24 = negative control (DMSO, ~2% inh)
+   Hit rate ~1.3 % (matches realistic primary screen)
+───────────────────────────────────────────────────────── */
+const ROWS = 'ABCDEFGHIJKLMNOP'.split('');
+const HIT_DEFS = [
+  { id:'DSP-001', name:'化合物 #0847', ec50:0.23, maxInh:96, hill:1.8, type:'ATP竞争性抑制' },
+  { id:'DSP-002', name:'化合物 #1203', ec50:0.78, maxInh:89, hill:1.5, type:'变构抑制剂' },
+  { id:'DSP-003', name:'化合物 #2541', ec50:1.45, maxInh:82, hill:1.3, type:'ATP竞争性抑制' },
+  { id:'DSP-004', name:'化合物 #3892', ec50:3.12, maxInh:78, hill:1.1, type:'底物竞争性抑制' },
+  { id:'DSP-005', name:'化合物 #4671', ec50:0.52, maxInh:93, hill:1.7, type:'变构抑制剂' },
+];
+
+function mkRng(seed) {
+  let s = seed >>> 0;
+  return () => { s = (Math.imul(1664525, s) + 1013904223) >>> 0; return s / 0xffffffff; };
+}
+const rng = mkRng(0xdeadbeef);
+
+function buildPlate() {
+  const wells = [];
+  let hitCursor = 0;
+  ROWS.forEach((row, ri) => {
+    for (let col = 1; col <= 24; col++) {
+      const id = `${row}${col}`;
+      let inh, type, cpd;
+      if (col === 1) {
+        inh = 91 + rng() * 8; type = 'pos';
+        cpd = { name:'阳性对照 (Staurosporine)', type:'参考抑制剂', ec50:null };
+      } else if (col === 24) {
+        inh = rng() * 7; type = 'neg';
+        cpd = { name:'阴性对照 (DMSO)', type:'溶剂对照', ec50:null };
+      } else {
+        const r = rng();
+        if (hitCursor < HIT_DEFS.length && r < 0.014) {
+          const h = HIT_DEFS[hitCursor++];
+          inh = h.maxInh - rng() * 4; type = 'hit'; cpd = h;
+        } else if (r < 0.042) {
+          inh = 30 + rng() * 38; type = 'moderate';
+          cpd = { name:`化合物 #${Math.floor(rng()*8999+1000)}`, type:'待确认', ec50:null };
+        } else {
+          inh = rng() * 18; type = 'inactive';
+          cpd = { name:`化合物 #${Math.floor(rng()*8999+1000)}`, type:'无活性', ec50:null };
+        }
+      }
+      wells.push({ id, row, col, ri, ci: col-1, inh: Math.round(inh*10)/10, type, cpd });
+    }
+  });
+  return wells;
+}
+
+function wellColor(inh, type) {
+  if (type === 'pos')  return '#ef4444';
+  if (type === 'neg')  return '#94a3b8';
+  if (inh >= 75) return `hsl(${(100-inh)*0.5|0}, 88%, 48%)`;
+  if (inh >= 45) return `hsl(${30+(70-inh)*0.4|0}, 82%, 54%)`;
+  if (inh >= 25) return 'hsl(48,72%,62%)';
+  return '#cbd5e1';
+}
+
+/* ─────────────────────────────────────────────────────────
+   Dose-Response Curve (4PL, pure SVG)
+───────────────────────────────────────────────────────── */
+function DRC({ cpd }) {
+  const { ec50, maxInh, hill = 1.5 } = cpd;
+  const W=300, H=190, PL=44, PB=36, PT=16, PR=14;
+  const cW=W-PL-PR, cH=H-PT-PB;
+  const logMin=-3, logMax=2;
+  const pts = Array.from({length:80},(_,i)=>logMin+(logMax-logMin)*i/79);
+  const y4pl = ld => (maxInh)/(1+Math.pow(ec50/Math.pow(10,ld), hill));
+  const sx = ld => PL+(ld-logMin)/(logMax-logMin)*cW;
+  const sy = y  => PT+cH-(y/100)*cH;
+  const d = pts.map((ld,i)=>`${i?'L':'M'}${sx(ld).toFixed(1)},${sy(y4pl(ld)).toFixed(1)}`).join('');
+  const ec50x = sx(Math.log10(ec50)), ec50y = sy(maxInh/2);
+  const xTicks=[[-3,'0.001'],[-2,'0.01'],[-1,'0.1'],[0,'1'],[1,'10'],[2,'100']];
+  const yTicks=[0,25,50,75,100];
+  return (
+    <svg width={W} height={H} className="overflow-visible">
+      {yTicks.map(t=><line key={t} x1={PL} y1={sy(t)} x2={PL+cW} y2={sy(t)} stroke="#e2e8f0" strokeWidth="1"/>)}
+      <line x1={PL} y1={PT} x2={PL} y2={PT+cH} stroke="#64748b" strokeWidth="1.5"/>
+      <line x1={PL} y1={PT+cH} x2={PL+cW} y2={PT+cH} stroke="#64748b" strokeWidth="1.5"/>
+      <path d={d} fill="none" stroke="#3b82f6" strokeWidth="2.5" strokeLinecap="round"/>
+      <line x1={ec50x} y1={PT} x2={ec50x} y2={ec50y} stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4,3"/>
+      <line x1={PL} y1={ec50y} x2={ec50x} y2={ec50y} stroke="#f59e0b" strokeWidth="1.5" strokeDasharray="4,3"/>
+      <circle cx={ec50x} cy={ec50y} r={4} fill="#f59e0b"/>
+      <text x={ec50x+6} y={ec50y-4} fontSize="9" fill="#d97706" fontWeight="600">EC₅₀={ec50}µM</text>
+      {xTicks.map(([v,l])=><text key={v} x={sx(v)} y={PT+cH+14} textAnchor="middle" fontSize="9" fill="#64748b">{l}</text>)}
+      {yTicks.map(t=><text key={t} x={PL-5} y={sy(t)+3} textAnchor="end" fontSize="9" fill="#64748b">{t}</text>)}
+      <text x={PL+cW/2} y={H-1} textAnchor="middle" fontSize="9" fill="#475569">浓度 (µM)</text>
+      <text x={10} y={PT+cH/2} textAnchor="middle" fontSize="9" fill="#475569"
+        transform={`rotate(-90,10,${PT+cH/2})`}>抑制率 (%)</text>
+    </svg>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   384-well Plate Heatmap
+───────────────────────────────────────────────────────── */
+function PlateMap({ wells, onSelect, sel }) {
+  const wmap = useMemo(()=>Object.fromEntries(wells.map(w=>[w.id,w])),[wells]);
+  return (
+    <div>
+      <div className="flex gap-[3px] mb-1 ml-[22px]">
+        {Array.from({length:24},(_,i)=>(
+          <div key={i} style={{width:13,fontSize:8,textAlign:'center',color:'#94a3b8',flexShrink:0}}>{i+1}</div>
+        ))}
+      </div>
+      {ROWS.map(row=>(
+        <div key={row} className="flex items-center gap-[3px] mb-[3px]">
+          <div style={{width:18,fontSize:8,textAlign:'right',color:'#94a3b8',marginRight:2,flexShrink:0}}>{row}</div>
+          {Array.from({length:24},(_,ci)=>{
+            const w = wmap[`${row}${ci+1}`];
+            if (!w) return null;
+            const isSel = sel?.id === w.id;
+            return (
+              <div key={ci} className="well"
+                style={{
+                  background: wellColor(w.inh, w.type),
+                  boxShadow: isSel ? '0 0 0 2px #fff,0 0 0 3.5px #3b82f6' : undefined,
+                }}
+                onClick={()=>onSelect(w)}
+                title={`${w.id} · ${w.cpd.name} · 抑制率 ${w.inh}%`}
+              />
+            );
+          })}
+        </div>
+      ))}
+      <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3">
+        {[
+          ['阳性对照','bg-red-500'],
+          ['强命中 ≥75%','bg-orange-500'],
+          ['中等活性 45–75%','bg-yellow-400'],
+          ['弱活性 25–45%','bg-yellow-200'],
+          ['无活性','bg-slate-300'],
+        ].map(([l,c])=>(
+          <div key={l} className="flex items-center gap-1">
+            <div className={`w-2.5 h-2.5 rounded-full ${c}`}/>
+            <span className="text-xs text-gray-400">{l}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   QC Stats
+───────────────────────────────────────────────────────── */
+function QCStats({ wells }) {
+  const pos = wells.filter(w=>w.type==='pos').map(w=>w.inh);
+  const neg = wells.filter(w=>w.type==='neg').map(w=>w.inh);
+  const test = wells.filter(w=>w.type!=='pos'&&w.type!=='neg');
+  const hits = wells.filter(w=>w.type==='hit');
+  const mod  = wells.filter(w=>w.type==='moderate');
+  const avg = a=>a.reduce((s,v)=>s+v,0)/a.length;
+  const sd  = a=>{ const m=avg(a); return Math.sqrt(a.reduce((s,v)=>s+(v-m)**2,0)/a.length); };
+  const zp  = 1-3*(sd(pos)+sd(neg))/Math.abs(avg(pos)-avg(neg));
+  const sb  = avg(pos)/avg(neg);
+  const stats = [
+    { l:"Z' 因子", v:zp.toFixed(3), ok:zp>0.5, sub:'质量标准 >0.5' },
+    { l:'S/B 比值', v:sb.toFixed(1)+'×', ok:sb>5, sub:'信噪比 >5 为优' },
+    { l:'命中率', v:(hits.length/test.length*100).toFixed(2)+'%', ok:true, sub:`${hits.length} 个强命中` },
+    { l:'待确认', v:mod.length+'个', ok:true, sub:'需浓度梯度确认' },
+    { l:'样品体积', v:'50 nL', ok:true, sub:'vs 传统 10 µL' },
+    { l:'检测方法', v:'HTRF', ok:true, sub:'均相均相，无洗板' },
+  ];
+  return (
+    <div className="grid grid-cols-2 gap-2.5">
+      {stats.map(s=>(
+        <div key={s.l} className={`p-3 rounded-xl border ${s.ok?'bg-green-50 border-green-200':'bg-yellow-50 border-yellow-200'}`}>
+          <div className="text-xs text-gray-500">{s.l}</div>
+          <div className="text-lg font-bold text-gray-900 mt-0.5">{s.v}</div>
+          <div className="text-xs text-gray-400 mt-0.5">{s.sub}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   Hit List
+───────────────────────────────────────────────────────── */
+function HitList({ wells, onSelect, sel }) {
+  const hits = useMemo(()=>
+    wells.filter(w=>w.inh>=70&&w.type!=='pos').sort((a,b)=>b.inh-a.inh),
+  [wells]);
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-sm font-semibold text-gray-700">命中化合物</span>
+        <span className="pill bg-red-100 text-red-600">{hits.length} 个</span>
+      </div>
+      <div className="space-y-1.5 max-h-56 overflow-y-auto thin-scroll">
+        {hits.map(w=>(
+          <div key={w.id} onClick={()=>onSelect(w)}
+            className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${sel?.id===w.id?'border-blue-400 bg-blue-50':'border-gray-200 bg-white hover:border-blue-200'}`}>
+            <div className="flex justify-between items-start">
+              <div>
+                <div className="text-sm font-medium text-gray-900 leading-tight">{w.cpd.name}</div>
+                <div className="text-xs text-gray-400">{w.cpd.type} · {w.id}</div>
+              </div>
+              <div className="text-right ml-2">
+                <div className="text-sm font-bold text-red-600">{w.inh}%</div>
+                {w.cpd.ec50&&<div className="text-xs text-gray-400">IC₅₀ {w.cpd.ec50}µM</div>}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   Cost Calculator
+───────────────────────────────────────────────────────── */
+function CostCalc() {
+  const [n, setN] = useState(10000);
+  const trad = n * 8;     // ¥8/well traditional
+  const ds   = n * 0.48;  // ¥0.48/well DrugScan
+  const save = trad - ds;
+  const pct  = (save/trad*100).toFixed(0);
+  return (
+    <div className="bg-white rounded-2xl border border-gray-200 p-6">
+      <h3 className="text-base font-bold text-gray-900 mb-4">成本对比计算器</h3>
+      <label className="block text-sm text-gray-600 mb-1.5">
+        化合物数量：<span className="font-bold text-blue-600">{n.toLocaleString()}</span> 个
+      </label>
+      <input type="range" min={1000} max={100000} step={1000} value={n}
+        onChange={e=>setN(+e.target.value)}
+        className="w-full accent-blue-600 mb-1"/>
+      <div className="flex justify-between text-xs text-gray-400 mb-5">
+        <span>1K</span><span>25K</span><span>50K</span><span>75K</span><span>100K</span>
+      </div>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="bg-gray-50 rounded-xl p-3.5">
+          <div className="text-xs text-gray-500 mb-1">传统 HTS（10 µL/孔）</div>
+          <div className="text-2xl font-bold text-gray-700">
+            ¥{trad>=10000?(trad/10000).toFixed(1)+'万':trad.toLocaleString()}
+          </div>
+          <div className="text-xs text-gray-400 mt-0.5">≈ ¥8/孔</div>
+        </div>
+        <div className="bg-blue-50 rounded-xl p-3.5 border border-blue-200">
+          <div className="text-xs text-blue-600 font-medium mb-1">DrugScan Pro（50 nL/孔）</div>
+          <div className="text-2xl font-bold text-blue-700">
+            ¥{ds>=10000?(ds/10000).toFixed(1)+'万':ds.toLocaleString()}
+          </div>
+          <div className="text-xs text-blue-500 mt-0.5">≈ ¥0.48/孔</div>
+        </div>
+      </div>
+      <div className="bg-green-50 border border-green-200 rounded-xl p-3.5 text-center">
+        <div className="text-xs text-green-700 mb-0.5">节省成本</div>
+        <div className="text-3xl font-bold text-green-600">
+          ¥{save>=10000?(save/10000).toFixed(1)+'万':save.toLocaleString()}
+        </div>
+        <div className="text-sm text-green-600 mt-0.5">较传统方案节省 <strong>{pct}%</strong></div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   Lead capture form
+───────────────────────────────────────────────────────── */
+function LeadForm() {
+  const [f,setF] = useState({company:'',name:'',email:'',phone:'',need:'',lib:'',timeline:'',note:''});
+  const [done,setDone] = useState(false);
+  const [busy,setBusy] = useState(false);
+  const submit = e => {
+    e.preventDefault(); setBusy(true);
+    setTimeout(()=>{ setBusy(false); setDone(true); }, 900);
+  };
+  if (done) return (
+    <div className="text-center py-14 fade-in">
+      <div className="text-5xl mb-4">✅</div>
+      <div className="text-2xl font-bold text-gray-900 mb-2">申请已收到</div>
+      <p className="text-gray-500">我们将在 2 个工作日内联系您，安排免费 PoC 评估</p>
+    </div>
+  );
+  return (
+    <form onSubmit={submit} className="max-w-2xl mx-auto">
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        {[
+          {k:'company',l:'公司 / 机构名称 *',ph:'例：某某生物技术有限公司',req:true},
+          {k:'name',l:'联系人姓名 *',ph:'姓名',req:true},
+          {k:'email',l:'邮箱 *',ph:'name@company.com',t:'email',req:true},
+          {k:'phone',l:'联系电话',ph:'+86'},
+        ].map(x=>(
+          <div key={x.k}>
+            <label className="block text-sm font-medium text-gray-700 mb-1">{x.l}</label>
+            <input type={x.t||'text'} required={x.req} placeholder={x.ph}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+              value={f[x.k]} onChange={e=>setF({...f,[x.k]:e.target.value})}/>
+          </div>
+        ))}
+      </div>
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">筛选需求类型 *</label>
+          <select required className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+            value={f.need} onChange={e=>setF({...f,need:e.target.value})}>
+            <option value="">请选择</option>
+            <option value="kinase">靶点筛选（激酶 / GPCR / 离子通道）</option>
+            <option value="cell">细胞表型筛选</option>
+            <option value="enzyme">酶活性筛选</option>
+            <option value="binding">均相亲和力筛选（TR-FRET / SPR替代）</option>
+            <option value="other">其他（备注说明）</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">化合物库规模</label>
+          <select className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+            value={f.lib} onChange={e=>setF({...f,lib:e.target.value})}>
+            <option value="">请选择</option>
+            <option value="s">{'<'} 5,000 个</option>
+            <option value="m">5,000 – 50,000 个</option>
+            <option value="l">50,000 – 200,000 个</option>
+            <option value="xl">自有化合物库（天然产物 / 中药提取物等）</option>
+          </select>
+        </div>
+      </div>
+      <div className="mb-4">
+        <label className="block text-sm font-medium text-gray-700 mb-1">预计启动时间</label>
+        <select className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+          value={f.timeline} onChange={e=>setF({...f,timeline:e.target.value})}>
+          <option value="">请选择</option>
+          <option value="1m">1 个月内</option>
+          <option value="3m">1–3 个月</option>
+          <option value="6m">3–6 个月</option>
+          <option value="eval">先评估，暂无固定时间表</option>
+        </select>
+      </div>
+      <div className="mb-6">
+        <label className="block text-sm font-medium text-gray-700 mb-1">靶点 / 项目背景（选填）</label>
+        <textarea rows={3}
+          className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+          placeholder="描述靶点、疾病领域、现有 assay 条件，或需要我们协助开发均相检测方法"
+          value={f.note} onChange={e=>setF({...f,note:e.target.value})}/>
+      </div>
+      <button type="submit" disabled={busy}
+        className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold text-base hover:bg-blue-700 disabled:opacity-60 transition-colors">
+        {busy ? '提交中...' : '申请免费 PoC 评估 →'}
+      </button>
+      <p className="text-center text-xs text-gray-400 mt-3">信息仅用于项目对接，不对外共享</p>
+    </form>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   Main App
+───────────────────────────────────────────────────────── */
+function App() {
+  const wells = useMemo(buildPlate, []);
+  const [sel, setSel] = useState(null);
+  const toggleSel = useCallback(w => setSel(p => p?.id===w.id ? null : w), []);
+  const go = id => document.getElementById(id)?.scrollIntoView({behavior:'smooth'});
+
+  const techSteps = [
+    { icon:'🧪', tag:'来源', title:'化合物库制备',
+      desc:'自有库 / 商业库 / 天然产物提取物\n标准化 96/384 孔板格式\nDMSO 溶解，浓度标注'},
+    { icon:'💧', tag:'核心技术', title:'超微量点样',
+      desc:'压电喷墨 / 声波分液\n50–500 nL / 孔精确分配\n兼容 384 孔 & 1536 孔'},
+    { icon:'⚡', tag:'检测方案', title:'均相检测读取',
+      desc:'HTRF / TR-FRET / AlphaScreen\n无洗板步骤，自动化友好\n信号稳定，与超微体积兼容'},
+    { icon:'🤖', tag:'AI 分析', title:'数据处理与命中',
+      desc:'自动 QC（Z\'、S/B、CV）\n4PL 量效关系拟合\n命中聚类与多靶点去重'},
+  ];
+
+  const advantages = [
+    { title:'为什么均相检测是关键', icon:'🔬', pts:[
+      '无洗板 = 完全兼容 50 nL 超微体积',
+      'TR-FRET 比值法消除内滤效应',
+      'AlphaScreen 支持蛋白互作检测',
+      '每板通量可扩展至 1,536 孔',
+      '假阳性率比荧光素酶法低 60%',
+    ]},
+    { title:'市场空白分析', icon:'🏁', pts:[
+      '竞对均聚焦 IVD / 生物芯片，未进药筛',
+      '传统 HTS 平台仍依赖 µL 量级体积',
+      '超微量技术用于药筛在国内尚属空白',
+      '先发优势窗口期预计 12–18 个月',
+      '目标：先拿 3–5 个付费 Pilot 客户',
+    ]},
+    { title:'MVP 验证路径', icon:'🎯', pts:[
+      'Phase 0：免费 PoC，验证 Z\' ≥ 0.6',
+      'Phase 1：3 家 Pilot，¥5万/项目',
+      'Phase 2：标准化 SOP，扩大通量',
+      '成功标准：端到端交付 ≥ 1 万化合物筛选',
+      '关键指标：客户愿付费 = 方向可行',
+    ]},
+  ];
+
+  const pricing = [
+    { name:'PoC 概念验证', price:'免费', sub:'首次合作', hl:false, cta:'免费申请',
+      fs:['1 个靶点评估','500 化合物初筛','均相 Assay 咨询',
+          'Z\' 验证报告','命中列表 + 原始数据'] },
+    { name:'Pilot 首批筛选', price:'¥2–5 万', sub:'/ 项目起', hl:true, cta:'立即咨询',
+      fs:['1–3 个靶点','5K–20K 化合物','Assay 开发包含',
+          '命中化合物二次确认','完整数据包 + PDF 报告','1 次免费方案修改'] },
+    { name:'Enterprise 全库筛选', price:'定制报价', sub:'按需定价', hl:false, cta:'获取报价',
+      fs:['不限靶点数','≥ 10 万化合物库','专属项目经理',
+          '全自动化 SOP','GMP 级数据记录','签署 NDA 保密'] },
+  ];
+
+  return (
+    <div className="min-h-screen">
+
+      {/* ── Nav ── */}
+      <nav className="fixed top-0 inset-x-0 z-50 bg-white/90 backdrop-blur border-b border-gray-200">
+        <div className="max-w-6xl mx-auto px-5 h-14 flex items-center justify-between">
+          <div className="font-bold text-blue-700 text-lg tracking-tight">DrugScan<span className="text-gray-900"> Pro</span></div>
+          <div className="hidden sm:flex items-center gap-6 text-sm text-gray-600">
+            {[['技术方案','tech'],['平台演示','demo'],['成本对比','cost'],['合作咨询','contact']].map(([l,id])=>(
+              <button key={id} onClick={()=>go(id)} className="hover:text-blue-600 transition-colors">{l}</button>
+            ))}
+          </div>
+          <button onClick={()=>go('contact')}
+            className="bg-blue-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:bg-blue-700 transition-colors">
+            申请免费 PoC
+          </button>
+        </div>
+      </nav>
+
+      {/* ── Hero ── */}
+      <section className="gradient-hero text-white pt-28 pb-20 px-5">
+        <div className="max-w-5xl mx-auto">
+          <div className="inline-flex items-center gap-2 bg-blue-500/20 border border-blue-400/30 rounded-full px-4 py-1.5 text-sm mb-6">
+            <span className="w-2 h-2 rounded-full bg-green-400" style={{animation:'pulse 2s infinite'}}/>
+            国内首个 超微量均相 高通量药筛平台 · MVP 公测开放
+          </div>
+          <h1 className="text-4xl sm:text-5xl font-bold mb-4 leading-tight">
+            高通量药筛<br/>
+            <span className="text-blue-400">成本降低 94%</span>
+          </h1>
+          <p className="text-lg sm:text-xl text-blue-100 mb-8 max-w-2xl">
+            超微量点样（50 nL/孔）× 均相检测方案（HTRF / TR-FRET），
+            两项技术协同，让万级化合物筛选触手可及。
+            无需千万自动化平台，即可开展媲美大型药企的初筛服务。
+          </p>
+          <div className="flex flex-wrap gap-3 mb-10">
+            <button onClick={()=>go('demo')}
+              className="bg-blue-500 hover:bg-blue-400 text-white px-6 py-3 rounded-xl font-semibold transition-colors">
+              查看平台演示 →
+            </button>
+            <button onClick={()=>go('contact')}
+              className="bg-white/10 hover:bg-white/20 border border-white/30 text-white px-6 py-3 rounded-xl font-semibold transition-colors">
+              申请试用
+            </button>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {[
+              {v:'50 nL',l:'点样体积',s:'节省 99.5% 试剂'},
+              {v:'1,536',l:'孔 / 板',s:'超高密度筛选'},
+              {v:'94%',l:'成本节省',s:'对比传统 HTS'},
+              {v:'<¥0.5',l:'元 / 化合物',s:'含试剂 + 检测'},
+            ].map(s=>(
+              <div key={s.l} className="bg-white/10 rounded-xl p-4 border border-white/20">
+                <div className="text-2xl font-bold">{s.v}</div>
+                <div className="text-sm text-blue-200 font-medium">{s.l}</div>
+                <div className="text-xs text-blue-300/70 mt-0.5">{s.s}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── Technology ── */}
+      <section id="tech" className="py-16 px-5 bg-gray-50">
+        <div className="max-w-6xl mx-auto">
+          <div className="text-center mb-10">
+            <div className="text-sm font-semibold text-blue-600 mb-2">核心技术</div>
+            <h2 className="text-3xl font-bold text-gray-900 mb-3">超微量 × 均相——完整药筛解决方案</h2>
+            <p className="text-gray-500 max-w-2xl mx-auto text-sm">
+              超微量点样大幅降低试剂消耗，均相检测保证低体积下的稳定信号。
+              两者缺一不可，共同构成可行的高密度药筛方案。
+            </p>
+          </div>
+
+          {/* Tech flow */}
+          <div className="flex flex-col sm:flex-row items-stretch gap-3 mb-8">
+            {techSteps.map((s, i) => (
+              <React.Fragment key={s.title}>
+                <div className="flex-1 bg-white rounded-2xl border border-gray-200 p-5 card-lift">
+                  <div className="text-3xl mb-2">{s.icon}</div>
+                  <span className="pill bg-blue-100 text-blue-700 mb-2">{s.tag}</span>
+                  <div className="text-sm font-bold text-gray-900 mt-2 mb-1.5">{s.title}</div>
+                  <div className="text-xs text-gray-500 whitespace-pre-line leading-relaxed">{s.desc}</div>
+                </div>
+                {i < 3 && (
+                  <div className="flex items-center justify-center text-gray-300 text-2xl px-1 hidden sm:flex">›</div>
+                )}
+              </React.Fragment>
+            ))}
+          </div>
+
+          {/* Advantage cards */}
+          <div className="grid sm:grid-cols-3 gap-5">
+            {advantages.map(a=>(
+              <div key={a.title} className="bg-white rounded-2xl border border-gray-200 p-5 card-lift">
+                <div className="text-2xl mb-2">{a.icon}</div>
+                <h3 className="text-sm font-bold text-gray-900 mb-3">{a.title}</h3>
+                <ul className="space-y-1.5">
+                  {a.pts.map((p,i)=>(
+                    <li key={i} className="flex items-start gap-1.5 text-xs text-gray-600">
+                      <span className="text-blue-400 mt-0.5 flex-shrink-0">•</span>{p}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── Demo ── */}
+      <section id="demo" className="py-16 px-5 bg-white">
+        <div className="max-w-6xl mx-auto">
+          <div className="text-center mb-10">
+            <div className="text-sm font-semibold text-blue-600 mb-2">平台演示</div>
+            <h2 className="text-3xl font-bold text-gray-900 mb-2">384 孔板筛选结果示例</h2>
+            <p className="text-gray-500 text-sm">
+              模拟数据：EGFR 激酶抑制剂初筛 · 10,000 化合物 · 检测方法：HTRF KinEASE-TK
+            </p>
+          </div>
+
+          <div className="grid lg:grid-cols-3 gap-5">
+            {/* Left: plate */}
+            <div className="lg:col-span-2 space-y-4">
+              <div className="bg-gray-50 rounded-2xl border border-gray-200 p-5 overflow-x-auto">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-sm font-semibold text-gray-700">384 孔板热图</span>
+                  <span className="text-xs text-gray-400">点击孔位查看详情</span>
+                </div>
+                <PlateMap wells={wells} onSelect={toggleSel} sel={sel}/>
+              </div>
+
+              {/* Selected well detail */}
+              {sel && (
+                <div className="bg-white rounded-2xl border border-blue-200 p-5 fade-in">
+                  <div className="flex justify-between items-start mb-3">
+                    <div>
+                      <div className="text-sm font-bold text-gray-900">{sel.cpd.name}</div>
+                      <div className="text-xs text-gray-400">{sel.cpd.type} · 孔位 {sel.id}</div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-xl font-bold text-red-600">{sel.inh}%</div>
+                      <div className="text-xs text-gray-400">单点抑制率（1 µM）</div>
+                    </div>
+                  </div>
+                  {sel.cpd.ec50 ? (
+                    <div>
+                      <div className="text-xs font-medium text-gray-500 mb-2">量效关系曲线（4PL 拟合）</div>
+                      <DRC cpd={sel.cpd}/>
+                    </div>
+                  ) : (
+                    <div className="text-sm text-gray-400 italic py-4 text-center">
+                      {sel.type==='pos' ? '阳性对照孔，无量效曲线' :
+                       sel.type==='neg' ? '阴性对照孔，无量效曲线' :
+                       '单点活性不显著，未进入量效确认阶段'}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Right: stats + hits */}
+            <div className="space-y-4">
+              <div className="bg-gray-50 rounded-2xl border border-gray-200 p-5">
+                <div className="text-sm font-semibold text-gray-700 mb-3">检测质量指标</div>
+                <QCStats wells={wells}/>
+              </div>
+              <div className="bg-gray-50 rounded-2xl border border-gray-200 p-5">
+                <HitList wells={wells} onSelect={toggleSel} sel={sel}/>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Cost ── */}
+      <section id="cost" className="py-16 px-5 bg-gray-50">
+        <div className="max-w-5xl mx-auto">
+          <div className="text-center mb-10">
+            <div className="text-sm font-semibold text-blue-600 mb-2">成本对比</div>
+            <h2 className="text-3xl font-bold text-gray-900 mb-3">让每家药企都用得起高通量筛选</h2>
+            <p className="text-gray-500 text-sm">拖动滑块，即时计算您的项目预算节省</p>
+          </div>
+          <div className="grid sm:grid-cols-2 gap-6 items-start">
+            <CostCalc/>
+            <div className="space-y-3">
+              {[
+                {s:'小型 Biotech 靶点初筛', n:'5,000', t:'4万', d:'0.24万', i:'🧬'},
+                {s:'中型药企靶点验证', n:'20,000', t:'16万', d:'0.96万', i:'🏭'},
+                {s:'大型药企化合物全库', n:'100,000', t:'80万', d:'4.8万', i:'🏢'},
+                {s:'学术机构天然产物筛选', n:'3,000', t:'2.4万', d:'0.14万', i:'🌿'},
+              ].map(x=>(
+                <div key={x.s} className="bg-white rounded-xl border border-gray-200 p-4 flex items-center gap-4">
+                  <div className="text-2xl">{x.i}</div>
+                  <div className="flex-1">
+                    <div className="text-sm font-semibold text-gray-900">{x.s}</div>
+                    <div className="text-xs text-gray-400">{x.n} 化合物</div>
+                  </div>
+                  <div className="text-right flex-shrink-0">
+                    <div className="text-xs text-gray-400 line-through">¥{x.t}</div>
+                    <div className="text-sm font-bold text-blue-600">¥{x.d}</div>
+                    <div className="text-xs text-green-600 font-medium">省 94%</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Pricing ── */}
+      <section className="py-16 px-5 bg-white">
+        <div className="max-w-5xl mx-auto">
+          <div className="text-center mb-10">
+            <div className="text-sm font-semibold text-blue-600 mb-2">服务套餐</div>
+            <h2 className="text-3xl font-bold text-gray-900">透明定价，按需选择</h2>
+          </div>
+          <div className="grid sm:grid-cols-3 gap-5">
+            {pricing.map(p=>(
+              <div key={p.name}
+                className={`rounded-2xl border p-6 ${p.hl?'bg-blue-600 border-blue-600 text-white':'bg-white border-gray-200'}`}>
+                <div className={`text-xs font-medium mb-1 ${p.hl?'text-blue-200':'text-blue-600'}`}>{p.name}</div>
+                <div className={`text-3xl font-bold mb-0.5 ${p.hl?'text-white':'text-gray-900'}`}>{p.price}</div>
+                <div className={`text-sm mb-5 ${p.hl?'text-blue-200':'text-gray-400'}`}>{p.sub}</div>
+                <ul className="space-y-2 mb-6">
+                  {p.fs.map((f,i)=>(
+                    <li key={i} className={`flex items-start gap-2 text-sm ${p.hl?'text-blue-100':'text-gray-600'}`}>
+                      <span className={`mt-0.5 flex-shrink-0 ${p.hl?'text-blue-200':'text-green-500'}`}>✓</span>{f}
+                    </li>
+                  ))}
+                </ul>
+                <button onClick={()=>go('contact')}
+                  className={`w-full py-2.5 rounded-xl font-semibold text-sm transition-colors ${
+                    p.hl?'bg-white text-blue-600 hover:bg-blue-50':'bg-blue-600 text-white hover:bg-blue-700'}`}>
+                  {p.cta}
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── FAQ ── */}
+      <section className="py-14 px-5 bg-gray-50">
+        <div className="max-w-3xl mx-auto">
+          <div className="text-center mb-8">
+            <div className="text-sm font-semibold text-blue-600 mb-2">常见问题</div>
+            <h2 className="text-2xl font-bold text-gray-900">技术与合作 FAQ</h2>
+          </div>
+          <div className="space-y-3">
+            {[
+              {q:'超微量点样（50 nL）在均相检测中信号是否稳定？',
+               a:'TR-FRET / HTRF 采用比值法读取，对体积变化不敏感。实际检测总体积仅需 ≥ 3 µL（点样后加入检测试剂至此体积），Z\' 因子可稳定在 0.6 以上。'},
+              {q:'你们是否接受客户自有化合物库（天然产物 / 中药提取物）？',
+               a:'完全接受。我们支持 DMSO 溶液格式（96/384 孔板）交付，提供标准化流程。天然产物库如有溶解性问题，可在 PoC 阶段先行评估 5% DMSO 耐受性。'},
+              {q:'如果靶点尚未建立均相 Assay，你们可以协助开发吗？',
+               a:'可以。Pilot 套餐中包含 Assay 开发服务。常见靶点类型（激酶、蛋白互作、酶活性）通常 2–3 周可完成方法建立和验证。'},
+              {q:'数据和化合物结构信息如何保护？',
+               a:'Enterprise 及 Pilot 合作均签署 NDA 保密协议，数据加密存储，仅项目参与人员可访问。化合物结构信息不留存于我方系统。'},
+              {q:'与传统 CRO 的高通量筛选服务有什么本质区别？',
+               a:'传统 CRO 使用 µL 量级检测，硬件和试剂成本高，周期长。我们的差异化在于：① 超微量体积 = 成本降低 94%；② 均相检测 = 流程更短、更少人工；③ 定价大幅下探，适合预算有限的 Biotech 和学术课题。'},
+            ].map((f,i)=>(
+              <FAQ key={i} q={f.q} a={f.a}/>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* ── Lead Form ── */}
+      <section id="contact" className="py-16 px-5 bg-white">
+        <div className="max-w-3xl mx-auto">
+          <div className="text-center mb-10">
+            <div className="text-sm font-semibold text-blue-600 mb-2">合作咨询</div>
+            <h2 className="text-3xl font-bold text-gray-900 mb-3">申请免费 PoC 概念验证</h2>
+            <p className="text-gray-500 text-sm">填写筛选需求，2 个工作日内提供方案建议和报价</p>
+          </div>
+          <div className="bg-white rounded-2xl border border-gray-200 p-7 shadow-sm">
+            <LeadForm/>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Footer ── */}
+      <footer className="bg-gray-900 text-gray-400 py-10 px-5">
+        <div className="max-w-5xl mx-auto flex flex-col sm:flex-row justify-between gap-6">
+          <div>
+            <div className="text-white font-bold text-lg mb-1">DrugScan Pro</div>
+            <div className="text-sm">超微量均相高通量药物筛选平台</div>
+            <div className="text-xs mt-1 text-gray-500">超微液滴技术 × HTRF / TR-FRET 均相检测</div>
+          </div>
+          <div className="grid grid-cols-2 gap-x-12 gap-y-1 text-sm">
+            {[['技术方案','tech'],['平台演示','demo'],['成本对比','cost'],['申请试用','contact']].map(([l,id])=>(
+              <button key={id} onClick={()=>go(id)} className="text-left hover:text-white transition-colors py-0.5">{l}</button>
+            ))}
+          </div>
+          <div className="text-sm text-right">
+            <div className="text-white mb-1">联系我们</div>
+            <div>bd@drugscan.cn</div>
+            <div className="text-xs mt-1 text-gray-500">本页数据为 MVP 演示用途</div>
+          </div>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────────────────
+   FAQ accordion
+───────────────────────────────────────────────────────── */
+function FAQ({ q, a }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+      <button
+        className="w-full text-left px-5 py-4 flex justify-between items-start gap-3 hover:bg-gray-50 transition-colors"
+        onClick={()=>setOpen(v=>!v)}>
+        <span className="text-sm font-medium text-gray-900">{q}</span>
+        <span className="text-gray-400 flex-shrink-0 mt-0.5">{open?'−':'+'}</span>
+      </button>
+      {open && (
+        <div className="px-5 pb-4 fade-in">
+          <p className="text-sm text-gray-600 leading-relaxed">{a}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
